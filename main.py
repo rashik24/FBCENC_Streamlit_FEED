@@ -51,7 +51,7 @@ def connection():
         password = os.environ["FBCENC_DB_PWD"]
 
     return pyodbc.connect(
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        "DRIVER={ODBC Driver 17 for SQL Server};"
         f"SERVER={server},1433;"
         "DATABASE=FBCENC_DEV;"
         "UID=fbcenc_datawriter;"
