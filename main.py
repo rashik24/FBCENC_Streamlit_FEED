@@ -57,7 +57,7 @@ def connection():
         "UID=fbcenc_datawriter;"
         f"PWD={password};"
         "Encrypt=yes;"
-        "TrustServerCertificate=no;"
+        "TrustServerCertificate=yes;"
         "Connection Timeout=30;"
     )
 def to_frame(cur):
