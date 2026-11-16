@@ -184,21 +184,21 @@ def prepare(geo_input, ledger_input, max_date):
 
 
 @st.cache_resource(show_spinner=False)
-def week_inputs(model, week_stamp):
+def week_inputs(_model, week_stamp):
     """Construct cluster-week membership and KDE from previous 10 completed weeks."""
     week = pd.Timestamp(week_stamp)
-    pos = model["weeks"].get_indexer([week])[0]
+    pos = _model["weeks"].get_indexer([week])[0]
     if pos < WINDOW or week < FIRST_INFERENCE_WEEK:
         raise ValueError("Selected week does not have the required ten historical weeks")
     j = pos - WINDOW  # rolling feature window ending at week pos-1
-    X = np.column_stack((model["static"], model["means"][:, j, :], model["stds"][:, j, :]))
-    raw_labels = model["kmeans"].predict(model["scaler"].transform(X))
-    labels = np.array([model["names"][int(label)] for label in raw_labels])
+    X = np.column_stack((_model["static"], _model["means"][:, j, :], _model["stds"][:, j, :]))
+    raw_labels = _model["kmeans"].predict(_model["scaler"].transform(X))
+    labels = np.array([_model["names"][int(label)] for label in raw_labels])
     kdes = {}
     sample_sizes = {}
     for cluster in ("A1", "A2", "A3", "A4"):
         # Same agency membership for the week, same trailing 10 weeks as its KDE samples.
-        values = model["capped_pounds"][labels==cluster, pos-WINDOW:pos, :].sum(axis=2).ravel()
+        values = _model["capped_pounds"][labels==cluster, pos-WINDOW:pos, :].sum(axis=2).ravel()
         sample_sizes[cluster] = len(values)
         if len(values) < 2 or not np.isfinite(values).all() or np.unique(values).size < 2:
             # Do not fabricate a KDE for a degenerate group.
