@@ -16,6 +16,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import pyodbc
+import streamlit as st
+
+st.write("Available ODBC drivers:", pyodbc.drivers())
 from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
