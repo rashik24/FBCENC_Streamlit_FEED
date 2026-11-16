@@ -1,4 +1,4 @@
-"""FBCENC weekly receiving capacity estimator: original FEEED2 PDF methodology.
+"""FBCENC capacity estimator with fixed or rolling K-means training: FEEED2 methodology.
 
 Input: dbo.Agency_Clustering_Features (geography), plus weekly cluster assignments
 and KDE samples. For the fixed-training/rolling-inference experiment requested:
@@ -34,6 +34,8 @@ N_CLUSTERS = 4
 WINDOW = 10
 TRAIN_START = pd.Timestamp("2018-07-01")
 TRAIN_END = pd.Timestamp("2020-06-30")
+TRAINING_WEEKS = 104
+TRAIN_MODES = ["Fixed (July 2018 – June 2020)", "Rolling (104 weeks)"]
 FIRST_INFERENCE_WEEK = pd.Timestamp("2020-07-06")
 
 st.set_page_config(page_title="FBCENC | Weekly Capacity Estimator", layout="wide")
@@ -123,9 +125,9 @@ def load_data():
 
 
 @st.cache_resource(show_spinner="Fitting fixed clustering model on 2018–June 2020 data...")
-def prepare(geo_input, ledger_input, max_date):
-    geo = geo_input.copy()
-    ledger = ledger_input.copy()
+def prepare(_geo_input, _ledger_input, max_date, data_signature):
+    geo = _geo_input.copy()
+    ledger = _ledger_input.copy()
     geo["Code"] = geo["Code"].astype(str).str.strip()
     geo["FIPS"] = normalize_fips(geo["FIPS"])
     for col in STATIC:
@@ -144,8 +146,8 @@ def prepare(geo_input, ledger_input, max_date):
     if len(codes) < N_CLUSTERS:
         raise ValueError("Insufficient agencies matching geographic and transaction records")
     geo = geo.loc[codes]
-    # Latest Monday whose Sunday is no later than the last posted date.
-    last_complete = max_date - pd.Timedelta(days=(max_date.weekday()+1) % 7 + 6) if max_date.weekday()!=6 else max_date-pd.Timedelta(days=6)
+    # Latest Monday with a complete Monday–Sunday week.
+    last_complete = max_date - pd.Timedelta(days=max_date.weekday() + (0 if max_date.weekday() == 6 else 7))
     weeks = pd.date_range("2018-07-02", last_complete, freq="W-MON")
     subset = ledger[ledger["Code"].isin(codes) & ledger["week_start"].isin(weeks)]
     weekly = subset.pivot_table(index=["Code", "week_start"], columns="storage", values="pounds", aggfunc="sum", fill_value=0)
@@ -180,35 +182,65 @@ def prepare(geo_input, ledger_input, max_date):
     return dict(geo=geo, codes=codes, weeks=weeks, static=static, means=rolling_means,
                 stds=rolling_stds, capped_pounds=capped_pounds, scaler=scaler,
                 kmeans=kmeans, names=names, excluded=excluded_count, negative_count=negative_count,
-                train_rows=len(train_X), latest_week=last_complete)
+                train_rows=len(train_X), latest_week=last_complete, receiving_pounds=positive)
+
+
+def fit_clustering_for_week(model, week, training_mode):
+    """Fit the scaler and K-means using only completed historical feature windows.
+
+    Fixed mode: all eligible rolling feature observations ending by June 30, 2020.
+    Rolling mode: rolling feature observations whose ending weeks fall in the
+    preceding 104 completed weeks, never the target week.
+    """
+    if training_mode == TRAIN_MODES[0]:
+        return model["scaler"], model["kmeans"], model["names"], model["train_rows"]
+    if training_mode != TRAIN_MODES[1]:
+        raise ValueError("Unrecognized training mode")
+    target = pd.Timestamp(week)
+    # Each feature observation corresponds to a 10-week window ending at a
+    # completed Monday-Sunday week. For a target Monday, the latest is the
+    # previous Monday. The first is the Monday 104 weeks before target.
+    ends = model["weeks"][WINDOW - 1:]
+    eligible = np.flatnonzero((ends >= target - pd.Timedelta(weeks=TRAINING_WEEKS)) & (ends < target))
+    if len(eligible) == 0:
+        raise ValueError("No eligible training feature weeks")
+    blocks = [np.column_stack((model["static"], model["means"][:, j, :], model["stds"][:, j, :])) for j in eligible]
+    X_train = np.vstack(blocks)
+    scaler = StandardScaler().fit(X_train)
+    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=20, random_state=42).fit(scaler.transform(X_train))
+    # Reapply the original volume-ranking labels after each refit.
+    # Use raw/zero-floored observed receiving volume from these training windows.
+    training_volumes = np.concatenate([model["receiving_pounds"][:, j:j + WINDOW, :].mean(axis=1).sum(axis=1) for j in eligible])
+    ranking = sorted(range(N_CLUSTERS), key=lambda k: -float(training_volumes[kmeans.labels_ == k].mean()))
+    names = {cluster: f"A{i + 1}" for i, cluster in enumerate(ranking)}
+    return scaler, kmeans, names, len(X_train)
 
 
 @st.cache_resource(show_spinner=False)
-def week_inputs(_model, week_stamp):
-    """Construct cluster-week membership and KDE from previous 10 completed weeks."""
+def week_inputs(_model, week_stamp, training_mode, model_version):
+    """Week-specific membership & KDE, using 10 preceding completed weeks."""
     week = pd.Timestamp(week_stamp)
     pos = _model["weeks"].get_indexer([week])[0]
     if pos < WINDOW or week < FIRST_INFERENCE_WEEK:
         raise ValueError("Selected week does not have the required ten historical weeks")
-    j = pos - WINDOW  # rolling feature window ending at week pos-1
+    scaler, kmeans, names, training_rows = fit_clustering_for_week(_model, week, training_mode)
+    j = pos - WINDOW
     X = np.column_stack((_model["static"], _model["means"][:, j, :], _model["stds"][:, j, :]))
-    raw_labels = _model["kmeans"].predict(_model["scaler"].transform(X))
-    labels = np.array([_model["names"][int(label)] for label in raw_labels])
+    raw_labels = kmeans.predict(scaler.transform(X))
+    labels = np.array([names[int(label)] for label in raw_labels])
     kdes = {}
     sample_sizes = {}
     for cluster in ("A1", "A2", "A3", "A4"):
-        # Same agency membership for the week, same trailing 10 weeks as its KDE samples.
-        values = _model["capped_pounds"][labels==cluster, pos-WINDOW:pos, :].sum(axis=2).ravel()
+        values = _model["capped_pounds"][labels == cluster, pos-WINDOW:pos, :].sum(axis=2).ravel()
         sample_sizes[cluster] = len(values)
         if len(values) < 2 or not np.isfinite(values).all() or np.unique(values).size < 2:
-            # Do not fabricate a KDE for a degenerate group.
             kdes[cluster] = None
         else:
             try:
                 kdes[cluster] = gaussian_kde(values)
             except np.linalg.LinAlgError:
                 kdes[cluster] = None
-    return labels, kdes, sample_sizes
+    return labels, kdes, sample_sizes, training_rows
 
 
 def simulate_pdf(counts, kdes, inner_runs, outer_runs, percentile, seed):
@@ -248,19 +280,19 @@ def render_histogram(estimates,title):
     return fig
 
 
-def make_result(model, week, fips, inner, outer, percentile, seed):
-    labels, kdes, sample_sizes = week_inputs(model,week)
+def make_result(model, week, fips, inner, outer, percentile, seed, training_mode, model_version):
+    labels, kdes, sample_sizes, train_rows = week_inputs(model, week, training_mode, model_version)
     regional = model["geo"].loc[model["codes"],"FIPS"].to_numpy()==fips
     counts = {c:int(np.sum(regional & (labels==c))) for c in ("A1","A2","A3","A4")}
     if sum(counts.values()) == 0:
         raise ValueError("No agencies with valid trained features in selected tract")
     result = simulate_pdf(counts,kdes,inner,outer,percentile,seed)
-    return result,counts,sample_sizes
+    return result, counts, sample_sizes, train_rows
 
 
 try:
     geo_source,ledger_source,last_posted = load_data()
-    model = prepare(geo_source,ledger_source,last_posted)
+    model = prepare(geo_source, ledger_source, last_posted, (len(geo_source), len(ledger_source), str(last_posted)))
 except Exception as exc:
     st.error(f"Initialization failed: {exc}")
     st.stop()
@@ -275,6 +307,7 @@ region["FIPS"] = normalize_fips(region["FIPS"])
 
 with st.sidebar:
     st.header("Select capacity estimate")
+    training_mode = st.radio("Clustering training mode", TRAIN_MODES, index=0)
     selected_month = st.selectbox("Month",months,index=0,format_func=lambda s:pd.Timestamp(s+"-01").strftime("%B %Y"))
     in_month = [w for w in valid_weeks if w.strftime("%Y-%m")==selected_month]
     week = st.selectbox("Week beginning (Monday)",in_month,format_func=lambda w:w.strftime("%b %d, %Y"))
@@ -293,18 +326,19 @@ with st.sidebar:
     st.caption("Uses 10 completed weeks preceding the selected week. No database writes.")
 
 st.markdown(f"### {pd.Timestamp(selected_month+'-01').strftime('%B %Y')} · {county} · {labels_for_tracts[fips]}")
-st.caption(f"Selected week: {week:%B %d, %Y} · Fixed clustering trained through June 2020 · 10-week rolling KDE inputs")
+st.caption(f"Selected week: {week:%B %d, %Y} · {training_mode} · 10-week rolling KDE inputs")
+model_version = f"{last_posted}|{len(ledger_source)}|{len(geo_source)}|{TRAIN_END.date()}|{WINDOW}"
 
 if run:
     try:
         with st.spinner("Running nested Monte Carlo capacity estimation..."):
-            values,counts,sample_sizes = make_result(model,week,fips,int(inner),int(outer),float(percentile),int(seed))
-        st.session_state["capacity_result"] = {"values":values,"counts":counts,"sizes":sample_sizes,
-             "key":(str(week),fips,int(inner),int(outer),float(percentile),int(seed))}
+            values,counts,sample_sizes,train_rows = make_result(model,week,fips,int(inner),int(outer),float(percentile),int(seed),training_mode,model_version)
+        st.session_state["capacity_result"] = {"values":values,"counts":counts,"sizes":sample_sizes,"train_rows":train_rows,
+             "key":(training_mode,str(week),fips,int(inner),int(outer),float(percentile),int(seed))}
     except Exception as exc:
         st.error(str(exc))
 
-key = (str(week),fips,int(inner),int(outer),float(percentile),int(seed))
+key = (training_mode,str(week),fips,int(inner),int(outer),float(percentile),int(seed))
 saved = st.session_state.get("capacity_result")
 if saved and saved["key"]==key:
     values = saved["values"]
@@ -313,6 +347,7 @@ if saved and saved["key"]==key:
                                [np.mean(values),np.std(values,ddof=1),np.min(values),np.max(values)]):
         col.metric(title,f"{value:,.0f} lbs/week")
     st.plotly_chart(render_histogram(values,f"Outer-loop {percentile:g}th-percentile estimates"),use_container_width=True)
+    st.caption(f"K-means training rows used: {saved['train_rows']:,}")
     st.write("**Agencies by cluster in selected tract**")
     st.dataframe(pd.DataFrame([{"cluster":c,"agency_count":n,"KDE_sample_count":saved["sizes"][c]} for c,n in saved["counts"].items()]),hide_index=True)
     st.download_button("Download outer-loop capacity estimates (CSV)",
@@ -335,8 +370,11 @@ with b:
 if st.button("Run comparison"):
     try:
         with st.spinner("Comparing capacity distributions..."):
-            left,_,_=make_result(model,left_week,left_fips,int(inner),int(outer),float(percentile),int(seed))
-            right,_,_=make_result(model,right_week,right_fips,int(inner),int(outer),float(percentile),int(seed)+1)
+            left,_,_,_=make_result(model,left_week,left_fips,int(inner),int(outer),float(percentile),int(seed),training_mode,model_version)
+            if left_week == right_week and left_fips == right_fips:
+                right = left.copy()
+            else:
+                right,_,_,_=make_result(model,right_week,right_fips,int(inner),int(outer),float(percentile),int(seed)+1,training_mode,model_version)
         m1,m2,m3=st.columns(3)
         m1.metric("Left mean capacity",f"{left.mean():,.0f} lbs/week")
         m2.metric("Right mean capacity",f"{right.mean():,.0f} lbs/week")
@@ -357,5 +395,5 @@ with st.expander("Data and model diagnostics"):
     st.write({"database":DB_NAME,"instance":EXPECTED_INSTANCE,"ledger_last_posting_date":str(last_posted.date()),
               "usable_last_complete_week":str(model["latest_week"].date()),"training_feature_rows":model["train_rows"],
               "excluded_agencies_missing_features":model["excluded"],"negative_ledger_cells_zero_floored":model["negative_count"],
-              "window_weeks":WINDOW})
+              "window_weeks":WINDOW,"training_mode":training_mode,"rolling_training_weeks":TRAINING_WEEKS})
     st.caption("The fixed-clustering training/inference split is a selected experimental setup; the capacity calculation follows the PDF. The input static features may postdate the historical evaluation period.")
