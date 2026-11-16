@@ -1,88 +1,105 @@
-"""FBCENC weekly receiving-volume forecasting dashboard.
+"""FBCENC weekly receiving capacity estimator: original FEEED2 PDF methodology.
 
-Train a fixed StandardScaler + 4-cluster KMeans through June 2020.
-At each post-training week use the previous 10 *completed* weeks to
-assign agencies and fit cluster-specific KDEs, then simulate a tract's
-weekly receiving quantities. This is a receiving-volume proxy, NOT a
-verified measure of physical receiving capacity.
+Input: dbo.Agency_Clustering_Features (geography), plus weekly cluster assignments
+and KDE samples. For the fixed-training/rolling-inference experiment requested:
+train StandardScaler + KMeans on completed training windows up to June 2020,
+then calculate each target week's cluster membership and KDE samples using
+only the preceding 10 completed weeks.
 
-Read-only SQL Server access: FBCENC_DEV / EC2AMAZ-BQQ4KPL.
-Run: streamlit run FBCENC_Streamlit.py
+Capacity algorithm (unchanged from PDF / app_capacity.py):
+ agency counts by region/cluster/week -> cluster-week Gaussian KDE -> for each
+ outer repetition, simulate M regional totals (one KDE sample per agency), floor
+ negative simulated draws at zero, take the desired percentile; report mean,
+ standard deviation, minimum and maximum across K percentile estimates.
+
+The month selector merely chooses weeks; no monthly capacity formula is invented.
+Read-only against SQL Server. Run: streamlit run FBCENC_Capacity_Streamlit.py
 """
 import os
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-import streamlit as st
 import pyodbc
 import streamlit as st
-
-st.write("Available ODBC drivers:", pyodbc.drivers())
-from scipy.stats import gaussian_kde
+import plotly.graph_objects as go
+from scipy.stats import gaussian_kde, norm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 DB_NAME = "FBCENC_DEV"
-INSTANCE = "EC2AMAZ-BQQ4KPL"
+EXPECTED_INSTANCE = "EC2AMAZ-BQQ4KPL"
 STORAGES = ["DRY", "REFRIG", "PRODUCE", "FROZEN"]
 STATIC = ["No_programs", "POPULATION", "RISK_SCORE"]
+N_CLUSTERS = 4
 WINDOW = 10
 TRAIN_START = pd.Timestamp("2018-07-01")
-TRAIN_CUTOFF = pd.Timestamp("2020-06-30")
-INFERENCE_START = pd.Timestamp("2020-07-06")  # first full July week
-N_CLUSTERS = 4
+TRAIN_END = pd.Timestamp("2020-06-30")
+FIRST_INFERENCE_WEEK = pd.Timestamp("2020-07-06")
 
-st.set_page_config(page_title="FBCENC | Weekly Receiving Forecast", layout="wide")
-st.title("FBCENC · Weekly Receiving Forecast")
-st.caption("Fixed clustering model (2018–June 2020) · 10-week rolling KDE · Walk-forward validation · Read-only FBCENC_DEV")
+st.set_page_config(page_title="FBCENC | Weekly Capacity Estimator", layout="wide")
+st.title("Weekly Receiving Capacity Estimator")
+st.caption("FEEED2 methodology: cluster-week KDEs → nested Monte Carlo → regional percentile-capacity summaries")
 
 
-import os
-import pyodbc
-import streamlit as st
+def setting(key, default=None):
+    # Streamlit Cloud secrets, with local environment fallback.
+    try:
+        value = st.secrets.get(key)
+        if value is not None:
+            return str(value)
+    except (FileNotFoundError, KeyError):
+        pass
+    return os.getenv(key, default)
+
 
 def connection():
-    try:
-        server = st.secrets["FBCENC_DB_SERVER"]
-        password = st.secrets["FBCENC_DB_PWD"]
-    except (KeyError, FileNotFoundError):
-        server = os.environ["FBCENC_DB_SERVER"]
-        password = os.environ["FBCENC_DB_PWD"]
-
+    server = setting("FBCENC_DB_SERVER")
+    password = setting("FBCENC_DB_PWD")
+    username = setting("FBCENC_DB_USER", "fbcenc_datawriter")
+    trust = setting("FBCENC_TRUST_SERVER_CERTIFICATE", "no").lower()
+    if not server or not password:
+        raise RuntimeError("Configure FBCENC_DB_SERVER and FBCENC_DB_PWD in Streamlit secrets or environment.")
+    if trust not in ("yes", "no"):
+        raise RuntimeError("FBCENC_TRUST_SERVER_CERTIFICATE must be yes or no")
+    available = pyodbc.drivers()
+    driver = next((d for d in ("ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server") if d in available), None)
+    if driver is None:
+        raise RuntimeError(f"Microsoft SQL Server ODBC driver missing. Available: {available}")
     return pyodbc.connect(
-        "DRIVER={ODBC Driver 17 for SQL Server};"
-        f"SERVER={server},1433;"
-        "DATABASE=FBCENC_DEV;"
-        "UID=fbcenc_datawriter;"
-        f"PWD={password};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=yes;"
-        "Connection Timeout=30;"
+        f"DRIVER={{{driver}}};SERVER={server},1433;DATABASE={DB_NAME};"
+        f"UID={username};PWD={password};Encrypt=yes;"
+        f"TrustServerCertificate={trust};Connection Timeout=30;",
+        autocommit=False,
     )
-def to_frame(cur):
-    return pd.DataFrame.from_records(cur.fetchall(), columns=[c[0] for c in cur.description])
 
 
-@st.cache_data(show_spinner="Loading weekly ledger and agency features from SQL Server…", ttl=3600)
-def load_sql_data(server, user):
-    """Reads SQL; credentials are taken only from environment, never cached as args."""
+def as_dataframe(cursor):
+    return pd.DataFrame.from_records(cursor.fetchall(), columns=[x[0] for x in cursor.description])
+
+
+def normalize_fips(s):
+    out = s.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    return out.where(out.str.fullmatch(r"\d{1,11}"), pd.NA).str.zfill(11)
+
+
+@st.cache_data(ttl=3600, show_spinner="Reading FBCENC_DEV ledger and geography...")
+def load_data():
     conn = connection()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT DB_NAME(), @@SERVERNAME, ORIGINAL_LOGIN()")
-        db, instance, login = cur.fetchone()
-        if (db, instance) != (DB_NAME, INSTANCE):
-            raise RuntimeError(f"Unsafe connection: {db} / {instance}; expected {DB_NAME} / {INSTANCE}.")
-        cur.execute("""
+        cursor = conn.cursor()
+        cursor.execute("SELECT DB_NAME(), @@SERVERNAME")
+        database, instance = cursor.fetchone()
+        if (database, instance) != (DB_NAME, EXPECTED_INSTANCE):
+            raise RuntimeError(f"Unexpected SQL destination: {database} / {instance}")
+        cursor.execute("""
             SELECT Code, City, Census_Tract_Name, county, FIPS,
                    No_programs, POPULATION, RISK_SCORE
             FROM dbo.Agency_Clustering_Features
         """)
-        features = to_frame(cur)
-        cur.execute("SELECT MAX([Posting Date]) FROM dbo.Item_Ledger WHERE [Entry Type]='Sale'")
-        latest_transaction_date = pd.Timestamp(cur.fetchone()[0]).normalize()
-        cur.execute("""
+        geo = as_dataframe(cursor)
+        cursor.execute("SELECT MAX([Posting Date]) FROM dbo.Item_Ledger WHERE [Entry Type]='Sale'")
+        max_date = pd.Timestamp(cursor.fetchone()[0]).normalize()
+        cursor.execute("""
             SELECT LEFT(LTRIM(RTRIM([Source No.])),5) AS Code,
                    DATEADD(day,-((DATEDIFF(day,'19000101',CAST([Posting Date] AS date)) % 7 + 7) % 7),
                            CAST([Posting Date] AS date)) AS week_start,
@@ -98,228 +115,247 @@ def load_sql_data(server, user):
                              CAST([Posting Date] AS date)),
                      [FBC Storage Requirement Code]
         """)
-        ledger = to_frame(cur)
-        return features, ledger, latest_transaction_date, login
+        ledger = as_dataframe(cursor)
+        return geo, ledger, max_date
     finally:
         conn.rollback()
         conn.close()
 
 
-def normalize_fips(x):
-    x = x.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
-    return x.where(x.str.fullmatch(r"\d{1,11}"), pd.NA).str.zfill(11)
-
-
-@st.cache_resource(show_spinner="Training fixed K-means on 2018–2020 windows…")
-def prepare_model(features, ledger, latest_date):
-    features = features.copy()
-    ledger = ledger.copy()
-    features["Code"] = features["Code"].astype(str).str.strip()
-    features["FIPS"] = normalize_fips(features["FIPS"])
-    for c in STATIC:
-        features[c] = pd.to_numeric(features[c], errors="coerce")
-    if features["Code"].duplicated().any():
-        raise ValueError("Duplicate Code in Agency_Clustering_Features")
-    valid = features[STATIC].notna().all(axis=1) & (features["POPULATION"] > 0)
-    excluded = features.loc[~valid, "Code"].tolist()
-    features = features.loc[valid & features["FIPS"].notna()].copy()
-    if len(features) < 4:
-        raise ValueError("Fewer than four agencies with complete features and FIPS")
-
+@st.cache_resource(show_spinner="Fitting fixed clustering model on 2018–June 2020 data...")
+def prepare(geo_input, ledger_input, max_date):
+    geo = geo_input.copy()
+    ledger = ledger_input.copy()
+    geo["Code"] = geo["Code"].astype(str).str.strip()
+    geo["FIPS"] = normalize_fips(geo["FIPS"])
+    for col in STATIC:
+        geo[col] = pd.to_numeric(geo[col], errors="coerce")
+    if geo["Code"].duplicated().any():
+        raise ValueError("Duplicate agency IDs in dbo.Agency_Clustering_Features")
+    excluded = geo[STATIC].isna().any(axis=1) | geo["POPULATION"].le(0) | geo["FIPS"].isna()
+    excluded_count = int(excluded.sum())
+    geo = geo.loc[~excluded].set_index("Code")
     ledger["Code"] = ledger["Code"].astype(str).str.strip()
     ledger["week_start"] = pd.to_datetime(ledger["week_start"])
     ledger["pounds"] = pd.to_numeric(ledger["pounds"], errors="coerce")
     if not np.isfinite(ledger["pounds"]).all():
-        raise ValueError("Non-finite transaction totals")
-    valid_codes = sorted(set(features["Code"]) & set(ledger["Code"]))
-    features = features.set_index("Code").loc[valid_codes]
-    if len(features) < 4:
-        raise ValueError("Insufficient matched agency codes between tables")
-    # Exclude the final partial week: Monday + 6 days must be <= last posting date.
-    last_complete_monday = latest_date - pd.Timedelta(days=latest_date.weekday()+7)
-    # If latest_date is a Sunday, the latest week that ended that Sunday is complete.
-    if latest_date.weekday() == 6:
-        last_complete_monday = latest_date - pd.Timedelta(days=6)
-    first_monday = pd.Timestamp("2018-07-02")
-    if last_complete_monday < INFERENCE_START:
-        raise ValueError("No complete post-training weeks")
-    weeks = pd.date_range(first_monday, last_complete_monday, freq="W-MON")
-    codes = pd.Index(valid_codes)
+        raise ValueError("Nonfinite weekly receiving quantities")
+    codes = pd.Index(sorted(geo.index.intersection(pd.Index(ledger["Code"].unique()))))
+    if len(codes) < N_CLUSTERS:
+        raise ValueError("Insufficient agencies matching geographic and transaction records")
+    geo = geo.loc[codes]
+    # Latest Monday whose Sunday is no later than the last posted date.
+    last_complete = max_date - pd.Timedelta(days=(max_date.weekday()+1) % 7 + 6) if max_date.weekday()!=6 else max_date-pd.Timedelta(days=6)
+    weeks = pd.date_range("2018-07-02", last_complete, freq="W-MON")
     subset = ledger[ledger["Code"].isin(codes) & ledger["week_start"].isin(weeks)]
     weekly = subset.pivot_table(index=["Code", "week_start"], columns="storage", values="pounds", aggfunc="sum", fill_value=0)
     weekly = weekly.reindex(columns=STORAGES, fill_value=0)
-    panel_index = pd.MultiIndex.from_product([codes, weeks], names=["Code", "week_start"])
-    weekly = weekly.reindex(panel_index, fill_value=0)
-    raw_values = weekly.to_numpy(dtype=float).reshape(len(codes), len(weeks), len(STORAGES))
-    # Negative NET sales can occur from returns/corrections. Zero-floor here only,
-    # retaining signed values for audit and reporting count.
-    n_negative = int((raw_values < 0).sum())
-    positive = np.maximum(raw_values, 0)
-    denom = features.loc[codes, "POPULATION"].to_numpy(dtype=float) * 0.13
-    scaled = positive / denom[:, None, None]
-    # Fit caps *only* on fully completed weeks ending by June 30, 2020.
-    train_week_mask = (weeks + pd.Timedelta(days=6) <= TRAIN_CUTOFF)
-    if train_week_mask.sum() < WINDOW:
-        raise ValueError("Not enough complete training weeks")
-    caps = np.quantile(scaled[:, train_week_mask, :].reshape(-1, len(STORAGES)), .99, axis=0)
+    weekly = weekly.reindex(pd.MultiIndex.from_product([codes, weeks], names=["Code", "week_start"]), fill_value=0)
+    raw = weekly.to_numpy(dtype=float).reshape(len(codes), len(weeks), len(STORAGES))
+    negative_count = int((raw < 0).sum())
+    # This follows the prior FBCENC implementation's handling of signed net ledger values.
+    positive = np.maximum(raw, 0.0)
+    denominator = geo["POPULATION"].to_numpy(dtype=float) * 0.13
+    scaled = positive / denominator[:, None, None]
+    completed_train = (weeks + pd.Timedelta(days=6)) <= TRAIN_END
+    if completed_train.sum() < WINDOW:
+        raise ValueError("Not enough historical training weeks")
+    caps = np.quantile(scaled[:, completed_train, :].reshape(-1, len(STORAGES)), 0.99, axis=0)
     scaled = np.minimum(scaled, caps)
-    # Historical (capped) pounds used to fit rolling KDEs.
-    capped_pounds = scaled * denom[:, None, None]
-    static = features.loc[codes, STATIC].to_numpy(dtype=float)
-    dyn = np.lib.stride_tricks.sliding_window_view(scaled, window_shape=WINDOW, axis=1)
-    means = dyn.mean(axis=-1)
-    stdevs = dyn.std(axis=-1, ddof=0)
-    # Window at position j ends at weeks[j+9]. Train on all completed training windows.
+    capped_pounds = scaled * denominator[:, None, None]
+    static = geo[STATIC].to_numpy(dtype=float)
+    rolling = np.lib.stride_tricks.sliding_window_view(scaled, WINDOW, axis=1)
+    rolling_means = rolling.mean(axis=-1)
+    rolling_stds = rolling.std(axis=-1, ddof=0)
     end_weeks = weeks[WINDOW-1:]
-    train_positions = np.flatnonzero(end_weeks + pd.Timedelta(days=6) <= TRAIN_CUTOFF)
-    feature_blocks = [np.column_stack([static, means[:, j, :], stdevs[:, j, :]]) for j in train_positions]
-    train_x = np.vstack(feature_blocks)
-    scaler = StandardScaler().fit(train_x)
-    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=20, random_state=42).fit(scaler.transform(train_x))
-    # Stable names: A1 highest historical receiving, A4 lowest, consistent with existing script.
-    train_labels = kmeans.labels_
-    mean_pounds = np.concatenate([positive[:, j:j+WINDOW, :].mean(axis=1).sum(axis=1) for j in train_positions])
-    rank = sorted(range(N_CLUSTERS), key=lambda label: -float(mean_pounds[train_labels == label].mean()))
-    raw_to_label = {raw: f"A{r+1}" for r, raw in enumerate(rank)}
-    return {
-        "features": features, "codes": codes, "weeks": weeks, "positive": positive,
-        "capped_pounds": capped_pounds, "static": static, "means": means,
-        "stdevs": stdevs, "scaler": scaler, "kmeans": kmeans,
-        "raw_to_label": raw_to_label, "caps": caps, "excluded": excluded,
-        "negative_count": n_negative, "last_complete_monday": last_complete_monday,
-        "train_windows": len(train_positions), "training_rows": len(train_x),
-    }
+    train_positions = np.flatnonzero((end_weeks + pd.Timedelta(days=6)) <= TRAIN_END)
+    blocks = [np.column_stack((static, rolling_means[:, j, :], rolling_stds[:, j, :])) for j in train_positions]
+    train_X = np.vstack(blocks)
+    scaler = StandardScaler().fit(train_X)
+    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=20, random_state=42).fit(scaler.transform(train_X))
+    # Preserve previous FBCENC naming: A1 highest receiving, A4 lowest.
+    means_for_ranking = np.concatenate([positive[:, j:j+WINDOW, :].mean(axis=1).sum(axis=1) for j in train_positions])
+    rank = sorted(range(N_CLUSTERS), key=lambda k: -float(means_for_ranking[kmeans.labels_==k].mean()))
+    names = {cluster: f"A{i+1}" for i, cluster in enumerate(rank)}
+    return dict(geo=geo, codes=codes, weeks=weeks, static=static, means=rolling_means,
+                stds=rolling_stds, capped_pounds=capped_pounds, scaler=scaler,
+                kmeans=kmeans, names=names, excluded=excluded_count, negative_count=negative_count,
+                train_rows=len(train_X), latest_week=last_complete)
 
 
-def week_prediction(model, target, fips, draws, outer_reps, seed):
-    weeks = model["weeks"]
-    loc = weeks.get_indexer([pd.Timestamp(target)])[0]
-    if loc < WINDOW or target < INFERENCE_START:
-        raise ValueError("Not enough historical weeks or target before inference period")
-    # Use the 10 weeks ending with the PREVIOUS completed Monday's week.
-    prev_window_position = loc - WINDOW  # feature window ending at weeks[loc-1]
-    x = np.column_stack([model["static"], model["means"][:, prev_window_position, :],
-                         model["stdevs"][:, prev_window_position, :]])
-    raw_labels = model["kmeans"].predict(model["scaler"].transform(x))
-    labels = np.asarray([model["raw_to_label"][x] for x in raw_labels])
-    region_mask = (model["features"].loc[model["codes"], "FIPS"].to_numpy() == fips)
-    actual = float(model["positive"][region_mask, loc, :].sum())
-    rng = np.random.default_rng(seed)
-    totals = np.zeros(draws, dtype=float)
-    kde_info = {}
+@st.cache_resource(show_spinner=False)
+def week_inputs(model, week_stamp):
+    """Construct cluster-week membership and KDE from previous 10 completed weeks."""
+    week = pd.Timestamp(week_stamp)
+    pos = model["weeks"].get_indexer([week])[0]
+    if pos < WINDOW or week < FIRST_INFERENCE_WEEK:
+        raise ValueError("Selected week does not have the required ten historical weeks")
+    j = pos - WINDOW  # rolling feature window ending at week pos-1
+    X = np.column_stack((model["static"], model["means"][:, j, :], model["stds"][:, j, :]))
+    raw_labels = model["kmeans"].predict(model["scaler"].transform(X))
+    labels = np.array([model["names"][int(label)] for label in raw_labels])
+    kdes = {}
+    sample_sizes = {}
     for cluster in ("A1", "A2", "A3", "A4"):
-        n = int(np.sum(region_mask & (labels == cluster)))
-        if n == 0:
-            continue
-        # Collect all prior 10-week *weekly totals* from agencies predicted into cluster.
-        historical = model["capped_pounds"][labels == cluster, loc-WINDOW:loc, :].sum(axis=2).ravel()
-        historical = historical[np.isfinite(historical)]
-        if historical.size < 2:
-            raise ValueError(f"Not enough KDE samples for {cluster} ({target:%Y-%m-%d})")
-        kde_info[cluster] = n
-        if np.std(historical) <= 0:
-            samples = np.full(draws*n, historical[0], dtype=float)
+        # Same agency membership for the week, same trailing 10 weeks as its KDE samples.
+        values = model["capped_pounds"][labels==cluster, pos-WINDOW:pos, :].sum(axis=2).ravel()
+        sample_sizes[cluster] = len(values)
+        if len(values) < 2 or not np.isfinite(values).all() or np.unique(values).size < 2:
+            # Do not fabricate a KDE for a degenerate group.
+            kdes[cluster] = None
         else:
-            kde = gaussian_kde(historical)
-            samples = kde.resample(draws*n, seed=rng).reshape(-1)
-        totals += np.maximum(samples.reshape(draws, n), 0).sum(axis=1)
-    if not kde_info:
-        raise ValueError("No agencies in selected tract that match the training model")
-    p95 = float(np.percentile(totals, 95))
-    # Original PDF: replicate P95 calculations to quantify sampling-estimator uncertainty.
-    # Separate from the predictive distribution used to compute coverage/CRPS.
-    p95_reps = np.array([np.percentile(ix, 95) for ix in np.array_split(np.random.default_rng(seed+1).choice(totals, draws*outer_reps, replace=True), outer_reps)]) if outer_reps else np.array([p95])
-    # CRPS unbiased empirical estimator of E|X-y| - .5 E|X-X'|;
-    # sorted O(n log n) calculation rather than O(n^2) pairwise matrix.
-    ordered = np.sort(totals)
-    m = len(ordered)
-    mean_abs_pair = (2.0 / (m*m)) * np.sum((2*np.arange(1,m+1)-m-1)*ordered)
-    crps = float(np.mean(np.abs(totals-actual)) - .5*mean_abs_pair)
-    return {
-        "week_start": pd.Timestamp(target), "actual_lbs": actual,
-        "pred_mean_lbs": float(totals.mean()), "pred_p05_lbs": float(np.percentile(totals, 5)),
-        "pred_p50_lbs": float(np.percentile(totals, 50)), "pred_p95_lbs": p95,
-        "pred_p95_estimator_sd": float(p95_reps.std(ddof=1)) if len(p95_reps)>1 else np.nan,
-        "n_agencies": int(region_mask.sum()), "cluster_counts": ", ".join(f"{k}:{v}" for k,v in kde_info.items()),
-        "absolute_error_lbs": abs(actual-float(totals.mean())), "crps_lbs": crps,
-        "below_p95": bool(actual<=p95), "inside_90pct_interval": bool(np.percentile(totals,5)<=actual<=p95),
-        "draws": totals,
-    }
+            try:
+                kdes[cluster] = gaussian_kde(values)
+            except np.linalg.LinAlgError:
+                kdes[cluster] = None
+    return labels, kdes, sample_sizes
+
+
+def simulate_pdf(counts, kdes, inner_runs, outer_runs, percentile, seed):
+    """Exact PDF nesting: each outer run estimates a percentile from fresh inner draws."""
+    if not 0 < percentile < 100 or inner_runs < 2 or outer_runs < 2:
+        raise ValueError("Invalid Monte Carlo settings")
+    missing = [c for c,n in counts.items() if n>0 and kdes.get(c) is None]
+    if missing:
+        raise ValueError(f"Cannot fit KDE for active clusters: {missing}")
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(outer_runs, dtype=float)
+    # Batch outer repetitions to avoid excessive memory use.
+    for start in range(0,outer_runs,20):
+        n_batch = min(20, outer_runs-start)
+        inner_totals = np.zeros((n_batch,inner_runs), dtype=float)
+        for c,n_agencies in counts.items():
+            if n_agencies <= 0:
+                continue
+            draws = kdes[c].resample(n_batch*inner_runs*n_agencies,seed=rng)
+            draws = draws.reshape(n_batch,inner_runs,n_agencies)
+            inner_totals += np.clip(draws,0,None).sum(axis=2)
+        estimates[start:start+n_batch] = np.percentile(inner_totals,percentile,axis=1)
+    return estimates
+
+
+def render_histogram(estimates,title):
+    mean = float(np.mean(estimates))
+    sd = float(np.std(estimates,ddof=1)) if len(estimates)>1 else 0.0
+    fig = go.Figure()
+    fig.add_histogram(x=estimates, histnorm="probability density", nbinsx=30,
+                      name="Outer-loop estimates", opacity=.65)
+    if sd > 0:
+        x = np.linspace(float(np.min(estimates)),float(np.max(estimates)),300)
+        fig.add_scatter(x=x,y=norm.pdf(x,mean,sd), mode="lines", name="Normal reference fit")
+    fig.update_layout(title=title,xaxis_title="Estimated weekly capacity (lbs)",
+                      yaxis_title="Density",height=420,barmode="overlay")
+    return fig
+
+
+def make_result(model, week, fips, inner, outer, percentile, seed):
+    labels, kdes, sample_sizes = week_inputs(model,week)
+    regional = model["geo"].loc[model["codes"],"FIPS"].to_numpy()==fips
+    counts = {c:int(np.sum(regional & (labels==c))) for c in ("A1","A2","A3","A4")}
+    if sum(counts.values()) == 0:
+        raise ValueError("No agencies with valid trained features in selected tract")
+    result = simulate_pdf(counts,kdes,inner,outer,percentile,seed)
+    return result,counts,sample_sizes
 
 
 try:
-    if not os.getenv("FBCENC_DB_SERVER") or not os.getenv("FBCENC_DB_PWD"):
-        st.error("Database credentials are missing. Set FBCENC_DB_SERVER and FBCENC_DB_PWD in the terminal before launching Streamlit.")
-        st.stop()
-    f, l, last_date, login = load_sql_data(os.getenv("FBCENC_DB_SERVER"), "fbcenc_datawriter")
-    model = prepare_model(f, l, last_date)
+    geo_source,ledger_source,last_posted = load_data()
+    model = prepare(geo_source,ledger_source,last_posted)
 except Exception as exc:
     st.error(f"Initialization failed: {exc}")
     st.stop()
 
-month_range = pd.period_range(INFERENCE_START, model["last_complete_monday"], freq="M")
-if len(month_range) == 0:
-    st.warning("No complete inference weeks available.")
+valid_weeks = [w for w in model["weeks"] if w>=FIRST_INFERENCE_WEEK]
+if not valid_weeks:
+    st.error("No complete weeks available after the training cutoff")
     st.stop()
+months = sorted({w.strftime("%Y-%m") for w in valid_weeks})
+region = model["geo"].copy()
+region["FIPS"] = normalize_fips(region["FIPS"])
 
 with st.sidebar:
-    st.header("Forecast settings")
-    month = st.selectbox("Select prediction month", list(month_range), format_func=lambda p:p.strftime("%B %Y"), index=len(month_range)-1)
-    county_list = sorted(model["features"]["county"].dropna().astype(str).unique().tolist())
-    county = st.selectbox("County", county_list)
-    county_features = model["features"][model["features"]["county"].astype(str)==county]
-    tracts = county_features[["FIPS", "Census_Tract_Name"]].drop_duplicates().sort_values("FIPS")
-    tract_choices = [(str(row.FIPS), str(row.Census_Tract_Name)) for row in tracts.itertuples()]
-    region = st.selectbox("Census tract", tract_choices, format_func=lambda x: f"{x[1]} · {x[0]}")
-    draws = st.number_input("Simulation draws per week", min_value=200, max_value=20000, value=2000, step=200)
-    outer = st.number_input("P95 stability repetitions", min_value=0, max_value=500, value=100, step=25)
-    run = st.button("Estimate selected month", type="primary", use_container_width=True)
+    st.header("Select capacity estimate")
+    selected_month = st.selectbox("Month",months,index=0,format_func=lambda s:pd.Timestamp(s+"-01").strftime("%B %Y"))
+    in_month = [w for w in valid_weeks if w.strftime("%Y-%m")==selected_month]
+    week = st.selectbox("Week beginning (Monday)",in_month,format_func=lambda w:w.strftime("%b %d, %Y"))
+    counties = sorted(region["county"].dropna().astype(str).unique())
+    county = st.selectbox("County",counties)
+    tracts = region.loc[region["county"].astype(str)==county,["FIPS","Census_Tract_Name"]].drop_duplicates()
+    labels_for_tracts = {r.FIPS:f"{r.Census_Tract_Name} · {r.FIPS}" for r in tracts.itertuples(index=False)}
+    fips = st.selectbox("Service region / tract",sorted(labels_for_tracts),format_func=lambda x:labels_for_tracts[x])
+    st.divider()
+    st.subheader("Monte Carlo settings")
+    percentile = st.number_input("Inner-loop percentile",min_value=1.0,max_value=99.9,value=95.0,step=1.0)
+    inner = st.number_input("Inner simulations (M)",min_value=2,max_value=5000,value=100,step=50)
+    outer = st.number_input("Outer repetitions (K)",min_value=2,max_value=10000,value=1000,step=100)
+    seed = st.number_input("Random seed",min_value=0,value=42)
+    run = st.button("Estimate weekly capacity",type="primary")
+    st.caption("Uses 10 completed weeks preceding the selected week. No database writes.")
 
-st.info("This estimates **realized weekly receiving volume**, used as a proxy for receiving capacity. It does not establish an agency's physical maximum capacity. The July 2018–June 2020 model is fixed; the KDE changes for each forecast week.")
-summary_cols = st.columns(4)
-summary_cols[0].metric("Training windows", f"{model['train_windows']:,}")
-summary_cols[1].metric("Training agency-weeks", f"{model['training_rows']:,}")
-summary_cols[2].metric("Matched agencies", f"{len(model['codes']):,}")
-summary_cols[3].metric("Last complete week", model['last_complete_monday'].strftime("%b %d, %Y"))
-with st.expander("Data and model notes"):
-    st.write(f"Database: {DB_NAME} ({INSTANCE}) · Login: {login}")
-    st.write(f"Source sales latest posting date: {last_date.date()}. Final partial week excluded.")
-    st.write(f"Excluded agencies with missing/nonpositive features: {len(model['excluded'])}. Negative storage-week quantities floored at zero: {model['negative_count']:,}.")
-    st.write("FEMA risk, population, and programs are sourced from the uploaded feature table. Historical values may not reflect the state of those features in 2020; retrospective validation is therefore conditional on that limitation.")
-    st.write("99th-percentile caps and StandardScaler/K-means are fit strictly before July 2020. Weekly KDEs use previous 10 completed weeks, capped using the training-only thresholds.")
-    st.write("July 2020 begins with the first complete Monday-starting week on July 6. Select a month to include Monday-starting weeks within it.")
+st.markdown(f"### {pd.Timestamp(selected_month+'-01').strftime('%B %Y')} · {county} · {labels_for_tracts[fips]}")
+st.caption(f"Selected week: {week:%B %d, %Y} · Fixed clustering trained through June 2020 · 10-week rolling KDE inputs")
 
 if run:
-    weeks = [w for w in model["weeks"] if w >= INFERENCE_START and w.to_period("M")==month]
-    if not weeks:
-        st.warning("No complete Monday-starting weeks are available for this month.")
-        st.stop()
     try:
-        progress = st.progress(0, text="Estimating weekly receiving distributions…")
-        rows = []
-        for idx,w in enumerate(weeks):
-            rows.append(week_prediction(model, w, region[0], int(draws), int(outer), seed=2020+idx))
-            progress.progress((idx+1)/len(weeks), text=f"Completed {idx+1}/{len(weeks)} weeks")
-        progress.empty()
+        with st.spinner("Running nested Monte Carlo capacity estimation..."):
+            values,counts,sample_sizes = make_result(model,week,fips,int(inner),int(outer),float(percentile),int(seed))
+        st.session_state["capacity_result"] = {"values":values,"counts":counts,"sizes":sample_sizes,
+             "key":(str(week),fips,int(inner),int(outer),float(percentile),int(seed))}
     except Exception as exc:
-        st.error(f"Forecast failed: {exc}")
-        st.stop()
-    result = pd.DataFrame([{k:v for k,v in row.items() if k!="draws"} for row in rows])
-    actual_total = float(result.actual_lbs.sum())
-    pred_total = float(result.pred_mean_lbs.sum())
-    st.subheader(f"{month.strftime('%B %Y')} · {county} · {region[1]}")
-    k1,k2,k3,k4 = st.columns(4)
-    k1.metric("Predicted month total", f"{pred_total:,.0f} lbs")
-    k2.metric("Actual month total", f"{actual_total:,.0f} lbs")
-    k3.metric("Absolute month error", f"{abs(actual_total-pred_total):,.0f} lbs")
-    k4.metric("Weekly P95 coverage", f"{result.below_p95.mean():.0%}")
-    display = result[["week_start", "n_agencies", "actual_lbs", "pred_mean_lbs", "pred_p50_lbs", "pred_p95_lbs", "absolute_error_lbs", "crps_lbs", "cluster_counts"]]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    st.line_chart(result.set_index("week_start")[["actual_lbs", "pred_mean_lbs", "pred_p95_lbs"]])
-    st.markdown(f"**Weekly MAE:** {result.absolute_error_lbs.mean():,.0f} lbs  ·  **Weekly RMSE:** {np.sqrt(np.mean((result.pred_mean_lbs-result.actual_lbs)**2)):,.0f} lbs  ·  **Mean CRPS:** {result.crps_lbs.mean():,.0f} lbs")
-    # Sum simulated draws per week for an approximate independent-week monthly distribution.
-    monthly_draws = np.sum(np.vstack([r["draws"] for r in rows]), axis=0)
-    st.caption(f"Monthly predictive 5th–95th percentile (assuming independent week draws): {np.percentile(monthly_draws,5):,.0f}–{np.percentile(monthly_draws,95):,.0f} lbs. Monthly coverage should be evaluated across many months, not one.")
-    st.download_button("Download weekly results CSV", data=result.to_csv(index=False).encode("utf-8"), file_name=f"receiving_forecast_{region[0]}_{month}.csv", mime="text/csv")
+        st.error(str(exc))
+
+key = (str(week),fips,int(inner),int(outer),float(percentile),int(seed))
+saved = st.session_state.get("capacity_result")
+if saved and saved["key"]==key:
+    values = saved["values"]
+    cols = st.columns(4)
+    for col,title,value in zip(cols,["Mean capacity", "Standard deviation", "Minimum", "Maximum"],
+                               [np.mean(values),np.std(values,ddof=1),np.min(values),np.max(values)]):
+        col.metric(title,f"{value:,.0f} lbs/week")
+    st.plotly_chart(render_histogram(values,f"Outer-loop {percentile:g}th-percentile estimates"),use_container_width=True)
+    st.write("**Agencies by cluster in selected tract**")
+    st.dataframe(pd.DataFrame([{"cluster":c,"agency_count":n,"KDE_sample_count":saved["sizes"][c]} for c,n in saved["counts"].items()]),hide_index=True)
+    st.download_button("Download outer-loop capacity estimates (CSV)",
+       pd.DataFrame({"week_stamp":str(week.date()),"FIPS":fips,"estimate_lbs":values}).to_csv(index=False),
+       file_name=f"capacity_{fips}_{week:%Y%m%d}.csv",mime="text/csv")
+    st.info("The summary is the distribution of repeated inner-loop percentile estimates, as specified in the FEEED2 PDF—not a prediction-error calculation.")
 else:
-    st.write("Choose a month, county, and census tract in the sidebar, then select **Estimate selected month**.")
+    st.write("Select a month, week and service region, then click **Estimate weekly capacity**.")
+
+st.divider()
+st.subheader("Compare two regions and/or weeks")
+st.caption("Runs the identical nested Monte Carlo procedure for each selection, as in the original app_capacity.py.")
+a,b=st.columns(2)
+with a:
+    left_week = st.selectbox("Left week",in_month,key="left_week")
+    left_fips = st.selectbox("Left tract",sorted(labels_for_tracts),format_func=lambda x:labels_for_tracts[x],key="left_fips")
+with b:
+    right_week = st.selectbox("Right week",in_month,index=min(1,len(in_month)-1),key="right_week")
+    right_fips = st.selectbox("Right tract",sorted(labels_for_tracts),index=min(1,len(labels_for_tracts)-1),format_func=lambda x:labels_for_tracts[x],key="right_fips")
+if st.button("Run comparison"):
+    try:
+        with st.spinner("Comparing capacity distributions..."):
+            left,_,_=make_result(model,left_week,left_fips,int(inner),int(outer),float(percentile),int(seed))
+            right,_,_=make_result(model,right_week,right_fips,int(inner),int(outer),float(percentile),int(seed)+1)
+        m1,m2,m3=st.columns(3)
+        m1.metric("Left mean capacity",f"{left.mean():,.0f} lbs/week")
+        m2.metric("Right mean capacity",f"{right.mean():,.0f} lbs/week")
+        m3.metric("Difference (right − left)",f"{right.mean()-left.mean():,.0f} lbs/week")
+        fig=go.Figure()
+        for draws,name in [(left,"Left"),(right,"Right")]:
+            fig.add_histogram(x=draws,histnorm="probability density",name=name,opacity=.40,nbinsx=30)
+            sd=np.std(draws,ddof=1)
+            if sd>0:
+                xs=np.linspace(draws.min(),draws.max(),300)
+                fig.add_scatter(x=xs,y=norm.pdf(xs,draws.mean(),sd),mode="lines",name=f"{name} normal fit")
+        fig.update_layout(barmode="overlay",xaxis_title="Estimated weekly capacity (lbs)",yaxis_title="Density")
+        st.plotly_chart(fig,use_container_width=True)
+    except Exception as exc:
+        st.error(str(exc))
+
+with st.expander("Data and model diagnostics"):
+    st.write({"database":DB_NAME,"instance":EXPECTED_INSTANCE,"ledger_last_posting_date":str(last_posted.date()),
+              "usable_last_complete_week":str(model["latest_week"].date()),"training_feature_rows":model["train_rows"],
+              "excluded_agencies_missing_features":model["excluded"],"negative_ledger_cells_zero_floored":model["negative_count"],
+              "window_weeks":WINDOW})
+    st.caption("The fixed-clustering training/inference split is a selected experimental setup; the capacity calculation follows the PDF. The input static features may postdate the historical evaluation period.")
