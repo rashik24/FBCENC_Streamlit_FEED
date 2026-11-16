@@ -35,22 +35,28 @@ st.title("FBCENC · Weekly Receiving Forecast")
 st.caption("Fixed clustering model (2018–June 2020) · 10-week rolling KDE · Walk-forward validation · Read-only FBCENC_DEV")
 
 
+import os
+import pyodbc
+import streamlit as st
+
 def connection():
-    server = os.getenv("FBCENC_DB_SERVER", "").strip()
-    pwd = os.getenv("FBCENC_DB_PWD", "")
-    if not server or not pwd:
-        raise RuntimeError("Set FBCENC_DB_SERVER and FBCENC_DB_PWD before launching Streamlit.")
-    trust = os.getenv("FBCENC_TRUST_SERVER_CERTIFICATE", "no").lower()
-    if trust not in ("yes", "no"):
-        raise RuntimeError("FBCENC_TRUST_SERVER_CERTIFICATE must be 'yes' or 'no'.")
+    try:
+        server = st.secrets["FBCENC_DB_SERVER"]
+        password = st.secrets["FBCENC_DB_PWD"]
+    except (KeyError, FileNotFoundError):
+        server = os.environ["FBCENC_DB_SERVER"]
+        password = os.environ["FBCENC_DB_PWD"]
+
     return pyodbc.connect(
         "DRIVER={ODBC Driver 18 for SQL Server};"
-        f"SERVER={server},1433;DATABASE={DB_NAME};UID=fbcenc_datawriter;PWD={pwd};"
-        f"Encrypt=yes;TrustServerCertificate={trust};Connection Timeout=30;",
-        autocommit=False,
+        f"SERVER={server},1433;"
+        "DATABASE=FBCENC_DEV;"
+        "UID=fbcenc_datawriter;"
+        f"PWD={password};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
     )
-
-
 def to_frame(cur):
     return pd.DataFrame.from_records(cur.fetchall(), columns=[c[0] for c in cur.description])
 
