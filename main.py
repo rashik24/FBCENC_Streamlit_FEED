@@ -56,7 +56,7 @@ def connection():
     server = setting("FBCENC_DB_SERVER")
     password = setting("FBCENC_DB_PWD")
     username = setting("FBCENC_DB_USER", "fbcenc_datawriter")
-    trust = setting("FBCENC_TRUST_SERVER_CERTIFICATE", "no").lower()
+    trust = setting("FBCENC_TRUST_SERVER_CERTIFICATE", "yes").lower()
     if not server or not password:
         raise RuntimeError("Configure FBCENC_DB_SERVER and FBCENC_DB_PWD in Streamlit secrets or environment.")
     if trust not in ("yes", "no"):
